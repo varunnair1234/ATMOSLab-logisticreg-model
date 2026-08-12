@@ -1,68 +1,91 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository.
 
-## Project
+## Project Overview
 
-Builds a coastal-fog dataset from NOAA ISD (Integrated Surface Database) hourly
-station observations, for training a per-height-bin fog/low-cloud classifier
-(logistic regression per the repo name) around three Central California
-stations: KMRY (Monterey), KWVI (Watsonville), KSJC (San Jose).
+This repo supports a research project predicting the **vertical distribution
+of fog** (base, top, depth) before drone flights over the Santa Cruz /
+Monterey Bay coast, for flight planning and go/no-go decisions. Full design
+rationale lives in the project proposal (fog is governed by marine
+boundary-layer structure, not surface conditions alone; training data comes
+from long-record remote sensing, not from the team's own limited drone
+flights, which serve only as in-situ validation).
 
-Currently the repo is just the data pipeline (`get_data.py`) plus its output
-(`data/train.csv`, `data/test.csv`); no model-training code exists yet.
+Current phase: building a **logistic regression baseline** before any deep
+model, per the proposal's "simple baselines first" plan.
 
-## Setup / commands
+## Data Pipeline — `get_data.py` (originally `build_training_data.py`)
 
-```bash
-python3 -m venv env && source env/bin/activate
-pip install -r requirements.txt   # pandas, requests, numpy, torch
-python get_data.py                # regenerates train.csv / test.csv (writes to CWD)
-```
+Pulls NOAA Integrated Surface Database (ISD) hourly data directly from the
+public S3 bucket `noaa-global-hourly-pds` (no auth needed) for three
+stations, engineers features, builds per-height-bin fog labels, and writes
+an event-based `train.csv` / `test.csv` split.
 
-There is no test suite, linter, or build step currently in the repo.
+**Stations (confirmed via `isd-history.txt`, cross-checked against a real
+downloaded sample file):**
+| Station | USAF | WBAN | S3 filename |
+|---|---|---|---|
+| KMRY (Monterey Regional) | 724915 | 23259 | `72491523259` |
+| KWVI (Watsonville Muni) | 745058 | 23277 | `74505823277` |
+| KSJC (San Jose Intl) | 724945 | 23293 | `72494523293` |
 
-`get_data.py` pulls directly from the public S3 bucket
-`noaa-global-hourly-pds` (no auth) for `YEARS = range(2015, 2024)`. Before
-running, verify the `STATIONS` dict in the CONFIG block at the top of the
-file — the USAF prefix of each USAF-WBAN identifier is called out in-file as
-unconfirmed and must be checked at https://www.ncei.noaa.gov/maps/hourly/.
-The script raises immediately if any station ID still contains
-`"PLACEHOLDER"`.
+**Known gotcha (already fixed, don't reintroduce):** ISD S3 filenames are
+`USAF` and `WBAN` **concatenated directly, no separator** (e.g.
+`72491523259.csv`), NOT `USAF-WBAN.csv`. The dash format 404s.
 
-## Pipeline structure (`get_data.py`)
+**Open question, not yet resolved:** the `CIG` (ceiling) field reports
+`99999` for a lot of rows. Unclear whether this means "genuinely missing
+observation" or something else for these specific ASOS stations. Currently
+treated as "no fog detected" (label = all zeros) rather than dropped, so as
+not to lose negative training examples. Spot-check a known-clear KMRY day
+against this before trusting fog labels at scale.
 
-Single-file pipeline, run top-to-bottom via `main()`:
+**Design choices already made:**
+- Height grid: surface to 2 km, 25 m bins (`HEIGHT_GRID_M`)
+- Fog threshold: ceiling < 500 m (`FOG_CEILING_THRESHOLD_M`)
+- Train/test split is by **fog event** (contiguous foggy hours), not by row
+  — prevents adjacent hours of the same event leaking across the split
+- ARM ceilometer backscatter fusion is stubbed (`pull_arm_ceilometer()`) but
+  not wired in yet — current labels are ceiling-only, which the proposal
+  itself flags as insufficient alone
 
-1. **Fetch** (`fetch_isd_station_year`) — one station-year of raw ISD CSV per
-   `(station, year)` combination.
-2. **Parse** (`build_surface_features`, `parse_ceiling`, `parse_temp_field`) —
-   unpacks ISD's packed string fields (`CIG` for ceiling, `TMP`/`DEW` for
-   temperature/dewpoint) into plain floats, deriving `dewpoint_depression_c`.
-   ISD's `99999`/`999` sentinel values become `NaN`.
-3. **Label** (`label_fog_bins`) — for each row, produces a binary vector over
-   `HEIGHT_GRID_M` (0–2000m, 25m spacing): 1 where a bin's height is at or
-   below the observed ceiling *and* the ceiling is below
-   `FOG_CEILING_THRESHOLD_M` (500m). This is a coarse ceiling-only proxy; the
-   code comments flag that it should eventually be replaced/fused with ARM
-   ceilometer backscatter data via `pull_arm_ceilometer` (stub, requires
-   `act-atmos` + `ARM_USERNAME`/`ARM_PASSWORD`) once available.
-4. **Split** (`event_based_split`) — splits by contiguous **fog event**, not
-   by row, so hours from the same fog event never straddle train/test. This
-   is deliberate to avoid temporal leakage — preserve this invariant if you
-   touch the splitting logic.
-5. **Write** — concatenates all station-years, drops rows missing
-   `temp_c`/`dewpoint_c` (but *not* rows with missing ceiling — those are
-   valid negative/no-fog examples, see `label_fog_bins` docstring), appends
-   one `fog_bin_{height}m` column per grid point, writes `train.csv` /
-   `test.csv` to the current working directory.
+## Modeling Plan (logistic regression baseline)
 
-## Known caveats baked into the code (read before changing labeling logic)
+Decided direction, not yet implemented — do these together, not piecemeal:
 
-- Whether ISD's `99999` "missing ceiling" code actually means clear sky vs.
-  truly missing data is unconfirmed for these three stations — see the
-  docstring on `parse_ceiling`. Spot-check before trusting fog labels at
-  scale.
-- `label_fog_bins` treats `NaN` ceiling as "no fog" by design (keeps the row
-  as a negative example) rather than dropping it — don't silently change this
-  without updating the split/labeling assumptions downstream.
+1. **Base/top reformulation.** Don't fit ~80 independent per-bin logistic
+   regressions. The label is a step function of height (1 below ceiling, 0
+   above), so predict fog base + fog top directly (2 regressions) and
+   reconstruct per-bin labels from those. Also fixes sparse-positive-bin
+   issues in the upper bins, which rarely see fog.
+2. **Add wind speed/direction** (ISD `WND` field) — currently missing from
+   `build_surface_features()`, even though the proposal's own cited
+   radiation-fog rule (RH ≥ 94%, wind ≤ 3 m/s, inversion > 250 m) depends on
+   it.
+3. **Add relative humidity** (Magnus formula from temp + dewpoint) instead
+   of relying on dewpoint depression alone.
+4. **Add a dewpoint-depression × wind-speed interaction term** — logistic
+   regression is linear and can't represent the "AND" condition in the
+   radiation-fog rule without it being handed in explicitly.
+5. **Class weighting** (`class_weight='balanced'`) and **probability
+   calibration** (Platt/isotonic) after fitting — fog-positive bins are a
+   small minority; raw imbalanced logistic regression will under-report
+   confidence on exactly the cases that matter for a go/no-go decision.
+6. Cyclical encoding (`sin`/`cos`) for `hour` and `day_of_year` instead of
+   raw integers.
+
+## Current Status / Next Step
+
+- [ ] Confirm `get_data.py` runs cleanly end-to-end after the filename fix
+      (last known state: fix applied, rerun not yet confirmed) and produces
+      non-trivial `train.csv` / `test.csv`
+- [ ] Implement base/top reformulation + wind/RH features + class
+      weighting + calibration together (Modeling Plan above)
+- [ ] Spot-check the `CIG=99999` assumption against real KMRY data
+
+## Out of Scope for This Repo
+
+A separate HuggingFace LLM integration ("actionable insights" layer) is
+planned but belongs to a different part of the project, not this
+logistic-regression pipeline. Don't conflate the two.
