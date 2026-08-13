@@ -50,39 +50,59 @@ against this before trusting fog labels at scale.
   not wired in yet — current labels are ceiling-only, which the proposal
   itself flags as insufficient alone
 
-## Modeling Plan (logistic regression baseline)
+## Pipeline / Roadmap
 
-Decided direction, not yet implemented — do these together, not piecemeal:
+The project runs in five phases. Phase 1 is implemented (`get_data.py`);
+phases 2–5 are planned, not yet built.
 
-1. **Base/top reformulation.** Don't fit ~80 independent per-bin logistic
-   regressions. The label is a step function of height (1 below ceiling, 0
-   above), so predict fog base + fog top directly (2 regressions) and
-   reconstruct per-bin labels from those. Also fixes sparse-positive-bin
-   issues in the upper bins, which rarely see fog.
-2. **Add wind speed/direction** (ISD `WND` field) — currently missing from
-   `build_surface_features()`, even though the proposal's own cited
-   radiation-fog rule (RH ≥ 94%, wind ≤ 3 m/s, inversion > 250 m) depends on
-   it.
-3. **Add relative humidity** (Magnus formula from temp + dewpoint) instead
-   of relying on dewpoint depression alone.
-4. **Add a dewpoint-depression × wind-speed interaction term** — logistic
+**Phase 1 — Data Pipeline** (`get_data.py`, done; see above for gotchas)
+1. Identify data sources — NOAA ISD, public S3 bucket
+2. Use Santa Cruz-area stations — KMRY, KWVI, KSJC
+3. `get_data.py` — script for retrieving and parsing data into CSV files
+4. Spot-check the `CIG=99999` assumption (still open, see above)
+
+**Phase 2 — Feature Engineering** (not yet implemented)
+1. Add wind speed/direction parsing — ISD `WND` field currently missing
+   from `build_surface_features()`, even though the proposal's own cited
+   radiation-fog rule (RH ≥ 94%, wind ≤ 3 m/s, inversion > 250 m) depends
+   on it
+2. Add RH (Magnus formula from temp + dewpoint) instead of relying on
+   dewpoint depression alone
+3. Add a dewpoint-depression × wind-speed interaction term — logistic
    regression is linear and can't represent the "AND" condition in the
-   radiation-fog rule without it being handed in explicitly.
-5. **Class weighting** (`class_weight='balanced'`) and **probability
-   calibration** (Platt/isotonic) after fitting — fog-positive bins are a
-   small minority; raw imbalanced logistic regression will under-report
-   confidence on exactly the cases that matter for a go/no-go decision.
-6. Cyclical encoding (`sin`/`cos`) for `hour` and `day_of_year` instead of
-   raw integers.
+   radiation-fog rule without it being handed in explicitly
+4. Cyclical encoding (`sin`/`cos`) for `hour` and `day_of_year` instead of
+   raw integers
+
+**Phase 3 — Model Formulation** (not yet implemented)
+1. Replace ~80 independent per-height-bin regressions with a base + top
+   formulation (2 regressions), reconstructing per-bin labels from those
+   two outputs — the label is a step function of height (1 below ceiling,
+   0 above), so this also fixes sparse-positive-bin issues in upper bins,
+   which rarely see fog
+
+**Phase 4 — Data Fitting** (not yet implemented)
+1. Fit with `class_weight='balanced'` — fog-positive bins are a small
+   minority
+2. Apply probability calibration (Platt or isotonic) after fitting so
+   predicted probability is trustworthy for go/no-go decisions
+
+**Phase 5 — Model Eval** (not yet implemented)
+1. Score with POD, FAR, CSI, PR-AUC per height bin
+2. MAE on predicted fog base/top height, plus reliability curves using
+   Matplotlib
+3. In-situ validation against the team's own drone flights
+4. Keep data testing
+5. 1D-CNN/GRU + MC-dropout uncertainty → go/no-go decision support
 
 ## Current Status / Next Step
 
 - [ ] Confirm `get_data.py` runs cleanly end-to-end after the filename fix
       (last known state: fix applied, rerun not yet confirmed) and produces
       non-trivial `train.csv` / `test.csv`
-- [ ] Implement base/top reformulation + wind/RH features + class
-      weighting + calibration together (Modeling Plan above)
 - [ ] Spot-check the `CIG=99999` assumption against real KMRY data
+- [ ] Begin Phase 2 (feature engineering: wind, RH, interaction term,
+      cyclical encoding)
 
 ## Out of Scope for This Repo
 
